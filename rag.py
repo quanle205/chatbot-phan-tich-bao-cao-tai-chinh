@@ -1,5 +1,5 @@
 """Pipeline RAG cho BCTC: parse PDF (bảng -> Markdown) -> chunk -> hybrid search (BM25 + dense, RRF)."""
-import glob, hashlib, json, os, re
+import csv, glob, hashlib, io, json, os, re
 from dataclasses import dataclass, asdict
 
 import numpy as np
@@ -21,7 +21,7 @@ class Chunk:
 
 # ---------- 1. Parse PDF (có OCR cho trang scan) ----------
 OCR_LANG = os.getenv("OCR_LANG", "vie+eng")
-OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+OCR_DPI = int(os.getenv("OCR_DPI", "300"))  # cao hon = nhan dien chu/so chinh xac hon, nhung cham hon
 MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "80"))  # giới hạn số trang OCR mỗi file để khỏi chạy quá lâu
 
 
@@ -48,9 +48,25 @@ def _needs_ocr(text, tables):
     return bad > 0.15 * max(len(text), 1)
 
 
-def _ocr_page(page, lang):
+def _ocr_cache_path(file_hash, page_no):
+    d = os.path.join(CACHE_DIR, "ocr")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{file_hash}_{page_no}_{OCR_LANG}_{OCR_DPI}.txt")
+
+
+def _ocr_page(page, lang, cache_key=None):
+    if cache_key:
+        p = _ocr_cache_path(*cache_key)
+        if os.path.exists(p):
+            return open(p, encoding="utf-8").read()
     tp = page.get_textpage_ocr(language=lang, dpi=OCR_DPI, full=True)
-    return page.get_text("text", textpage=tp, sort=True).strip()
+    text = page.get_text("text", textpage=tp, sort=True).strip()
+    if cache_key:
+        try:
+            open(_ocr_cache_path(*cache_key), "w", encoding="utf-8").write(text)
+        except OSError:
+            pass
+    return text
 
 
 def parse_pdf(data: bytes, name: str, progress=None):
@@ -58,6 +74,7 @@ def parse_pdf(data: bytes, name: str, progress=None):
     doc = pymupdf.open(stream=data, filetype="pdf")
     pages, info = [], {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
     lang = None
+    file_hash = hashlib.md5(data).hexdigest()[:16]
     for i, page in enumerate(doc, 1):
         if progress:
             progress(i, len(doc))
@@ -88,7 +105,7 @@ def parse_pdf(data: bytes, name: str, progress=None):
                     info["ocr_missing"] = True
                 else:
                     try:
-                        o = _ocr_page(page, lang)
+                        o = _ocr_page(page, lang, cache_key=(file_hash, i))
                         if len(o) > len(text):
                             text, tmd, ocr = o, [], True
                             info["ocr_pages"] += 1
@@ -201,22 +218,152 @@ class Index:
         return [(self.chunks[i], scores[i]) for i in top]
 
 
+def parse_docx(data: bytes, name: str):
+    """Word: mỗi heading cấp 1 coi là 1 'trang' ảo để còn dẫn nguồn được; bảng Word -> Markdown."""
+    import docx
+    d = docx.Document(io.BytesIO(data))
+    pages, buf, pno = [], [], 1
+
+    def flush():
+        nonlocal buf, pno
+        if buf:
+            pages.append({"page": pno, "text": "\n".join(buf).strip(), "tables": [], "ocr": False})
+            buf, pno = [], pno + 1
+
+    for el in d.element.body:
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag == "p":
+            from docx.text.paragraph import Paragraph
+            para = Paragraph(el, d)
+            if para.style and para.style.name and para.style.name.lower().startswith("heading") and buf:
+                flush()
+            if para.text.strip():
+                buf.append(para.text.strip())
+        elif tag == "tbl":
+            from docx.table import Table
+            t = Table(el, d)
+            rows = [[c.text.strip() for c in r.cells] for r in t.rows]
+            if rows:
+                md = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * len(rows[0])]
+                md += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+                pages.append({"page": pno, "text": "", "tables": ["\n".join(md)], "ocr": False})
+                pno += 1
+    flush()
+    if not pages:
+        pages = [{"page": 1, "text": "", "tables": [], "ocr": False}]
+    return pages, {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+
+
+def parse_csv(data: bytes, name: str):
+    """CSV: toàn bộ thành 1 bảng Markdown (coi là 1 trang)."""
+    text = data.decode("utf-8-sig", errors="replace")
+    try:
+        dialect = csv.Sniffer().sniff(text[:2000], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    rows = list(csv.reader(io.StringIO(text), dialect))
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return [{"page": 1, "text": "", "tables": [], "ocr": False}], {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    md = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width] + ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return [{"page": 1, "text": "", "tables": ["\n".join(md)], "ocr": False}], {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+
+
+def parse_xlsx(data: bytes, name: str):
+    """Excel: mỗi sheet là 1 'trang' (số thứ tự), bảng -> Markdown; ô trống ở cuối dòng/cột được cắt bớt."""
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    pages = []
+    for i, ws in enumerate(wb.worksheets, 1):
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            if any(v not in (None, "") for v in row):
+                rows.append(["" if v is None else str(v) for v in row])
+        if not rows:
+            continue
+        width = max(len(r) for r in rows)
+        rows = [r + [""] * (width - len(r)) for r in rows]
+        md = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width] + ["| " + " | ".join(r) + " |" for r in rows[1:]]
+        pages.append({"page": i, "text": f"[Sheet: {ws.title}]", "tables": ["\n".join(md)], "ocr": False})
+    if not pages:
+        pages = [{"page": 1, "text": "(file Excel rỗng)", "tables": [], "ocr": False}]
+    return pages, {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+
+
+def parse_txt(data: bytes, name: str):
+    """File .txt: coi là văn bản đã được OCR/làm sạch từ nơi khác. Trang ngăn bằng dòng \f hoặc '---PAGE n---'."""
+    text = data.decode("utf-8", errors="replace")
+    parts = re.split(r"\f|^-{0,3}\s*PAGE\s+\d+\s*-{0,3}\s*$", text, flags=re.MULTILINE | re.IGNORECASE)
+    parts = [p for p in parts if p.strip()] or [text]
+    return [{"page": i, "text": p.strip(), "tables": [], "ocr": False} for i, p in enumerate(parts, 1)], \
+           {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+
+
+SUPPORTED_EXT = (".pdf", ".docx", ".csv", ".xlsx", ".xls", ".txt")
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "40"))
+
+_PARSERS = {
+    ".pdf": lambda data, name, cb: parse_pdf(data, name, cb),
+    ".docx": lambda data, name, cb: parse_docx(data, name),
+    ".csv": lambda data, name, cb: parse_csv(data, name),
+    ".xlsx": lambda data, name, cb: parse_xlsx(data, name),
+    ".xls": lambda data, name, cb: parse_xlsx(data, name),
+    ".txt": lambda data, name, cb: parse_txt(data, name),
+}
+_NO_OCR_INFO = {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+
+
 def build_index(files: dict, use_dense=True, progress=None):
-    """files: {tên_file: bytes}. progress(msg, fraction) tuỳ chọn. Trả về (Index, cảnh báo)."""
-    chunks, warns = [], []
+    """files: {tên_file: bytes}. progress(msg, fraction) tuỳ chọn. Trả về (Index, cảnh báo, thống kê mỗi file).
+    Tự bỏ qua file lỗi/không hỗ trợ/quá lớn thay vì làm hỏng cả mẻ; mỗi file được báo riêng trong `warns`/`stats`."""
+    chunks, warns, stats = [], [], []
     names = list(files)
+    seen_hash = {}
     for k, name in enumerate(names):
+        ext = os.path.splitext(name)[1].lower()
+        data = files[name]
+        size_mb = len(data) / 1_000_000
         cb = (lambda i, n, k=k, name=name: progress(f"{name}: trang {i}/{n}", (k + i / n) / len(names))) if progress else None
-        pages, info = parse_pdf(files[name], name, cb)
+
+        if ext not in SUPPORTED_EXT:
+            warns.append(f"{name}: bỏ qua — định dạng {ext or '(không rõ)'} chưa hỗ trợ (chỉ nhận PDF, DOCX, CSV, XLSX, TXT).")
+            continue
+        if size_mb > MAX_FILE_MB:
+            warns.append(f"{name}: bỏ qua — file {size_mb:.0f} MB vượt giới hạn {MAX_FILE_MB} MB.")
+            continue
+        h = hashlib.md5(data).hexdigest()
+        if h in seen_hash:
+            warns.append(f"{name}: bỏ qua — nội dung trùng với file '{seen_hash[h]}' đã nạp.")
+            continue
+        seen_hash[h] = name
+
+        try:
+            pages, info = _PARSERS[ext](data, name, cb)
+        except Exception as e:
+            warns.append(f"{name}: lỗi khi đọc file ({e.__class__.__name__}: {e}) — đã bỏ qua, các file khác vẫn được xử lý.")
+            continue
+
         if info["ocr_pages"]:
             warns.append(f"{name}: {info['ocr_pages']} trang là ảnh scan, đã dùng OCR. OCR có thể đọc sai chữ/số — hãy đối chiếu số liệu với file gốc.")
         if info["ocr_missing"]:
             warns.append(f"{name}: có trang scan nhưng chưa cài Tesseract nên chưa đọc được (cần packages.txt: tesseract-ocr, tesseract-ocr-vie).")
         if info["ocr_skipped"]:
             warns.append(f"{name}: bỏ qua {info['ocr_skipped']} trang scan vượt giới hạn OCR ({MAX_OCR_PAGES} trang/file).")
-        if sum(len(p["text"]) + sum(map(len, p["tables"])) for p in pages) < 40 * max(len(pages), 1):
-            warns.append(f"{name}: vẫn gần như không có text sau khi OCR — file có thể bị lỗi hoặc ảnh quá mờ.")
-        chunks += make_chunks(pages, name, start_id=len(chunks))
+        total_chars = sum(len(p["text"]) + sum(map(len, p["tables"])) for p in pages)
+        # Chỉ cảnh báo khi thực sự gần như trống (file lỗi/mã hoá lạ/ảnh quá mờ), không áp cho
+        # file ngắn hợp lệ (ghi chú 1 dòng, 1 trang ít chữ...) — dùng ngưỡng tuyệt đối, không nhân theo số trang.
+        if ext == ".pdf" and total_chars < 25 and not info["ocr_pages"]:
+            warns.append(f"{name}: gần như không có nội dung đọc được — file có thể bị lỗi, mã hoá lạ, hoặc là PDF scan cần OCR.")
+        elif ext != ".pdf" and total_chars < 10:
+            warns.append(f"{name}: gần như không có nội dung đọc được — file có thể bị lỗi hoặc rỗng.")
+
+        start = len(chunks)
+        file_chunks = make_chunks(pages, name, start_id=start)
+        chunks += file_chunks
+        stats.append({"name": name, "pages": len(pages), "chunks": len(file_chunks),
+                      "tables": sum(c.kind == "table" for c in file_chunks), "ocr_pages": info["ocr_pages"]})
     if progress:
         progress("Đang tạo index...", 1.0)
-    return Index(chunks, use_dense), warns
+    return Index(chunks, use_dense), warns, stats

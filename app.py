@@ -37,13 +37,18 @@ SAMPLES = ["Doanh thu thuần quý I là bao nhiêu?", "Lợi nhuận sau thuế
            "Biên lợi nhuận gộp là bao nhiêu phần trăm?", "Dòng tiền thuần từ hoạt động kinh doanh là bao nhiêu?"]
 
 
-@st.cache_resource(show_spinner="Đang đọc PDF, tách bảng, tạo index...")
-def load_default(use_dense):
-    files = {os.path.basename(p): open(p, "rb").read() for p in sorted(glob.glob(os.path.join(DATA, "*.pdf")))}
-    if not files:
-        return None, {}, []
-    idx, warns = build_index(files, use_dense)
-    return idx, files, warns
+def _default_files():
+    exts = ("*.pdf", "*.docx", "*.csv", "*.xlsx", "*.xls", "*.txt")
+    # README nội bộ không phải dữ liệu BCTC -> đặt tên khác đuôi hỗ trợ (.md) để khỏi bị lẫn vào index
+    paths = sorted(p for e in exts for p in glob.glob(os.path.join(DATA, e)))
+    return {os.path.basename(p): open(p, "rb").read() for p in paths}
+
+
+def _do_build(files, use_dense):
+    bar = st.progress(0.0, text="Đang xử lý (file scan cần OCR nên có thể mất vài phút)...")
+    idx, warns, stats = build_index(files, use_dense, progress=lambda msg, f: bar.progress(min(f, 1.0), text=msg))
+    bar.empty()
+    st.session_state.update(index=idx, files=files, history=[], chat=[], warns=warns, stats=stats)
 
 
 with st.sidebar:
@@ -53,21 +58,24 @@ with st.sidebar:
     top_k = st.slider("Số đoạn truy xuất (Top-K)", 3, 12, 6)
     alpha = st.slider("Trọng số dense vs BM25", 0.0, 1.0, 0.5, 0.1, disabled=not use_dense)
     st.caption(f"Model: {llm.PROVIDER} / {llm.MODEL}")
-    ups = st.file_uploader("Hoặc tải PDF khác để thử", type="pdf", accept_multiple_files=True)
-    if ups and st.button("Xây dựng index từ file tải lên", type="primary"):
-        files = {u.name: u.getvalue() for u in ups}
-        bar = st.progress(0.0, text="Đang xử lý (file scan cần OCR nên có thể mất vài phút)...")
-        idx, warns = build_index(files, use_dense, progress=lambda msg, f: bar.progress(min(f, 1.0), text=msg))
-        bar.empty()
-        st.session_state.update(index=idx, files=files, history=[], chat=[], warns=warns)
+
+    ups = st.file_uploader("Tải thêm file (PDF, Word, Excel, CSV, TXT)",
+                           type=["pdf", "docx", "csv", "xlsx", "xls", "txt"], accept_multiple_files=True)
+    merge = st.checkbox("Gộp với file mặc định trong `data/`", True,
+                        help="Tắt nếu chỉ muốn dùng riêng các file vừa tải lên")
+    if ups and st.button("Xây dựng lại index", type="primary"):
+        files = dict(_default_files()) if merge else {}
+        files.update({u.name: u.getvalue() for u in ups})  # file trùng tên sẽ ghi đè bản mặc định
+        _do_build(files, use_dense)
 
 if "index" not in st.session_state:
-    idx, files, warns = load_default(use_dense)
-    if idx is not None:
-        st.session_state.update(index=idx, files=files, history=[], chat=[], warns=warns)
+    files = _default_files()
+    if files:
+        with st.spinner("Đang đọc file mặc định, tách bảng, tạo index..."):
+            _do_build(files, use_dense)
 
 if "index" not in st.session_state:
-    st.info("Chưa có dữ liệu: đặt file PDF BCTC vào thư mục `data/` của repo, hoặc tải file lên ở thanh bên.")
+    st.info("Chưa có dữ liệu: đặt file vào thư mục `data/` của repo (PDF/Word/Excel/CSV/TXT), hoặc tải file lên ở thanh bên.")
     st.stop()
 
 with st.sidebar:
@@ -76,6 +84,14 @@ with st.sidebar:
     ch = st.session_state.index.chunks
     st.success(f"Đã index {len(ch)} đoạn ({sum(c.kind == 'table' for c in ch)} bảng) từ {len(st.session_state.files)} file")
     st.caption("Tìm kiếm: " + ("hybrid (BM25 + embedding)" if st.session_state.index.emb is not None else "BM25"))
+    stats = st.session_state.get("stats") or []
+    if stats:
+        with st.expander(f"Chi tiết {len(stats)} file đã nạp"):
+            st.dataframe(
+                [{"File": s["name"], "Trang": s["pages"], "Đoạn": s["chunks"], "Bảng": s["tables"],
+                  "Trang OCR": s["ocr_pages"]} for s in stats],
+                hide_index=True, use_container_width=True,
+            )
     st.header("Câu hỏi mẫu")
     pick = None
     for s in SAMPLES:
@@ -89,7 +105,7 @@ def render_sources(hits, text, key):
         c, _ = hits[n - 1]
         with st.expander(f"[#{n}] {c.doc} — trang {c.page} ({'bảng' if c.kind == 'table' else 'văn bản'})"):
             st.markdown(c.text)
-            if st.checkbox("Xem trang PDF gốc", key=f"pg{key}_{n}"):
+            if c.doc.lower().endswith(".pdf") and st.checkbox("Xem trang PDF gốc", key=f"pg{key}_{n}"):
                 pdf = pymupdf.open(stream=st.session_state.files[c.doc], filetype="pdf")
                 st.image(pdf[c.page - 1].get_pixmap(dpi=110).tobytes("png"))
 
