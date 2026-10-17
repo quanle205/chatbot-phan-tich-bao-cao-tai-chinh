@@ -56,8 +56,9 @@ with st.sidebar:
     ups = st.file_uploader("Hoặc tải PDF khác để thử", type="pdf", accept_multiple_files=True)
     if ups and st.button("Xây dựng index từ file tải lên", type="primary"):
         files = {u.name: u.getvalue() for u in ups}
-        with st.spinner("Đang xử lý..."):
-            idx, warns = build_index(files, use_dense)
+        bar = st.progress(0.0, text="Đang xử lý (file scan cần OCR nên có thể mất vài phút)...")
+        idx, warns = build_index(files, use_dense, progress=lambda msg, f: bar.progress(min(f, 1.0), text=msg))
+        bar.empty()
         st.session_state.update(index=idx, files=files, history=[], chat=[], warns=warns)
 
 if "index" not in st.session_state:

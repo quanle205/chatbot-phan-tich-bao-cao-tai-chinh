@@ -1,5 +1,5 @@
 """Pipeline RAG cho BCTC: parse PDF (bảng -> Markdown) -> chunk -> hybrid search (BM25 + dense, RRF)."""
-import hashlib, json, os, re
+import glob, hashlib, json, os, re
 from dataclasses import dataclass, asdict
 
 import numpy as np
@@ -19,12 +19,48 @@ class Chunk:
     text: str
 
 
-# ---------- 1. Parse PDF ----------
-def parse_pdf(data: bytes, name: str):
-    """Trả về list page: {page, text, tables[markdown]}. Bảng được tách riêng để không vỡ hàng/cột."""
+# ---------- 1. Parse PDF (có OCR cho trang scan) ----------
+OCR_LANG = os.getenv("OCR_LANG", "vie+eng")
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "80"))  # giới hạn số trang OCR mỗi file để khỏi chạy quá lâu
+
+
+def _setup_tesseract():
+    """Trả về ngôn ngữ OCR dùng được (vie+eng, eng) hoặc None nếu chưa cài tesseract."""
+    if not os.environ.get("TESSDATA_PREFIX"):
+        for d in glob.glob("/usr/share/tesseract-ocr/*/tessdata") + glob.glob("/usr/share/tessdata"):
+            if os.path.isdir(d):
+                os.environ["TESSDATA_PREFIX"] = d
+                break
+    d = os.environ.get("TESSDATA_PREFIX", "")
+    if not d or not os.path.isdir(d):
+        return None
+    have = {f.split(".")[0] for f in os.listdir(d) if f.endswith(".traineddata")}
+    langs = [l for l in OCR_LANG.split("+") if l in have]
+    return "+".join(langs) or None
+
+
+def _needs_ocr(text, tables):
+    n = len(text) + sum(len(t) for t in tables)
+    if n < 80:
+        return True
+    bad = sum(1 for ch in text if ch == "\ufffd" or 0xE000 <= ord(ch) <= 0xF8FF)  # font mã hoá lỗi
+    return bad > 0.15 * max(len(text), 1)
+
+
+def _ocr_page(page, lang):
+    tp = page.get_textpage_ocr(language=lang, dpi=OCR_DPI, full=True)
+    return page.get_text("text", textpage=tp, sort=True).strip()
+
+
+def parse_pdf(data: bytes, name: str, progress=None):
+    """Trả về (pages, info). pages: list {page, text, tables[markdown], ocr}. Bảng được tách riêng để không vỡ hàng/cột."""
     doc = pymupdf.open(stream=data, filetype="pdf")
-    pages = []
+    pages, info = [], {"ocr_pages": 0, "ocr_missing": False, "ocr_skipped": 0}
+    lang = None
     for i, page in enumerate(doc, 1):
+        if progress:
+            progress(i, len(doc))
         tables = []
         try:
             for t in page.find_tables().tables:
@@ -41,8 +77,25 @@ def parse_pdf(data: bytes, name: str):
             if any((r & tr).get_area() > 0.5 * max(r.get_area(), 1e-6) for tr, _ in tables):
                 continue  # block này đã nằm trong bảng
             blocks.append(b[4].strip())
-        pages.append({"page": i, "text": "\n".join(blocks), "tables": [m for _, m in tables]})
-    return pages
+        text, tmd, ocr = "\n".join(blocks), [m for _, m in tables], False
+        if _needs_ocr(text, tmd):
+            if info["ocr_pages"] >= MAX_OCR_PAGES:
+                info["ocr_skipped"] += 1
+            else:
+                if lang is None:
+                    lang = _setup_tesseract() or ""
+                if not lang:
+                    info["ocr_missing"] = True
+                else:
+                    try:
+                        o = _ocr_page(page, lang)
+                        if len(o) > len(text):
+                            text, tmd, ocr = o, [], True
+                            info["ocr_pages"] += 1
+                    except Exception:
+                        info["ocr_missing"] = True
+        pages.append({"page": i, "text": text, "tables": tmd, "ocr": ocr})
+    return pages, info
 
 
 # ---------- 2. Chunking ----------
@@ -148,12 +201,22 @@ class Index:
         return [(self.chunks[i], scores[i]) for i in top]
 
 
-def build_index(files: dict, use_dense=True):
-    """files: {tên_file: bytes}. Trả về (Index, cảnh báo)."""
+def build_index(files: dict, use_dense=True, progress=None):
+    """files: {tên_file: bytes}. progress(msg, fraction) tuỳ chọn. Trả về (Index, cảnh báo)."""
     chunks, warns = [], []
-    for name, data in files.items():
-        pages = parse_pdf(data, name)
+    names = list(files)
+    for k, name in enumerate(names):
+        cb = (lambda i, n, k=k, name=name: progress(f"{name}: trang {i}/{n}", (k + i / n) / len(names))) if progress else None
+        pages, info = parse_pdf(files[name], name, cb)
+        if info["ocr_pages"]:
+            warns.append(f"{name}: {info['ocr_pages']} trang là ảnh scan, đã dùng OCR. OCR có thể đọc sai chữ/số — hãy đối chiếu số liệu với file gốc.")
+        if info["ocr_missing"]:
+            warns.append(f"{name}: có trang scan nhưng chưa cài Tesseract nên chưa đọc được (cần packages.txt: tesseract-ocr, tesseract-ocr-vie).")
+        if info["ocr_skipped"]:
+            warns.append(f"{name}: bỏ qua {info['ocr_skipped']} trang scan vượt giới hạn OCR ({MAX_OCR_PAGES} trang/file).")
         if sum(len(p["text"]) + sum(map(len, p["tables"])) for p in pages) < 40 * max(len(pages), 1):
-            warns.append(f"{name}: gần như không có text — có thể là PDF scan, cần OCR trước.")
+            warns.append(f"{name}: vẫn gần như không có text sau khi OCR — file có thể bị lỗi hoặc ảnh quá mờ.")
         chunks += make_chunks(pages, name, start_id=len(chunks))
+    if progress:
+        progress("Đang tạo index...", 1.0)
     return Index(chunks, use_dense), warns
